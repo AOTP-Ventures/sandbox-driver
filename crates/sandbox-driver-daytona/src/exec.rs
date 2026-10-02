@@ -7,9 +7,9 @@ use std::{io, mem, process};
 use async_trait::async_trait;
 use daytona_sdk::{DaytonaError, FileSystemService, ProcessService, SessionCommandLogsResult};
 use sandbox_driver::{
-    Capability, Error, Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult,
-    IncompleteOperation, OutputCaptureBuffer, OutputSanitizer, OutputSink, OutputStream, Result,
-    SpawnSpec, StdioProcess, StopLevel, Termination, run_with_stop_grace,
+    Error, Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult, IncompleteOperation,
+    OutputCaptureBuffer, OutputSanitizer, OutputSink, OutputStream, Result, SpawnSpec,
+    StdioProcess, StopLevel, Termination, run_with_stop_grace,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -22,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 use crate::sdk::{DaytonaClient, daytona_error};
 use crate::session::{Session, WaitOutcome, dedup_capture, missing_suffix, wait_for_completion};
 use crate::shell::{exec_line, shell_quote};
-use crate::{encoded_exec, resolve_path, stdio, toolbox};
+use crate::{encoded_exec, input_relay, resolve_path, stdio, toolbox};
 
 #[derive(Deserialize)]
 struct BufferedResponse {
@@ -276,8 +276,11 @@ impl DaytonaTransport {
         spec: &ExecSpec,
         controls: ExecControls,
     ) -> Result<ExecStreamingResult> {
-        if controls.stdin.is_some() {
-            return Err(Error::unsupported(Capability::ExecStdinStream));
+        if controls.stdin.is_some() && spec.stdin.is_some() {
+            return Err(Error::invalid_spec(
+                "stdin",
+                "fixed and streamed stdin are mutually exclusive",
+            ));
         }
         // Sessions cost three extra API calls, so plain buffered runs —
         // every derived fs/search/git operation — keep the one-shot
@@ -285,7 +288,11 @@ impl DaytonaTransport {
         // transport. Daytona ends a command by deleting its session,
         // which is one stop level: a term and a kill end the command the
         // same way, and the result reports whichever was asked for.
-        if controls.sink.is_some() || controls.term.is_some() || controls.kill.is_some() {
+        if controls.stdin.is_some()
+            || controls.sink.is_some()
+            || controls.term.is_some()
+            || controls.kill.is_some()
+        {
             return self.run_session(spec, controls).await;
         }
         self.run_buffered(spec, &controls).await
@@ -413,8 +420,43 @@ impl DaytonaTransport {
         controls: ExecControls,
     ) -> Result<ExecStreamingResult> {
         let started = Instant::now();
+        let input =
+            match controls.stdin.as_ref() {
+                Some(source) => Some(source.take().ok_or_else(|| {
+                    Error::invalid_spec("stdin", "input source already consumed")
+                })?),
+                None => None,
+            };
+        let process = if input.is_some() {
+            let sandbox = toolbox::sandbox(&self.client, &self.sandbox_id).await?;
+            Some(toolbox::process_of(&sandbox).await?)
+        } else {
+            None
+        };
         let run = SessionRun::start(self, spec, &controls).await?;
-        let outcome = match run.wait(spec.timeout, controls.stop_requested()).await {
+        let outcome_result = {
+            let wait = run.wait(spec.timeout, controls.stop_requested());
+            tokio::pin!(wait);
+            if let (Some(reader), Some(process)) = (input, process) {
+                let feed = input_relay::feed(process, run.session.id(), &run.command_id, reader);
+                tokio::pin!(feed);
+                tokio::select! {
+                    outcome = &mut wait => outcome,
+                    result = &mut feed => match result {
+                        Ok(()) => wait.await,
+                        Err(error) => {
+                            // Input may race a command that deliberately stops reading.
+                            if matches!(run.session.exit_code(&run.command_id).await, Ok(Some(_))) {
+                                wait.await
+                            } else { Err(error) }
+                        },
+                    },
+                }
+            } else {
+                wait.await
+            }
+        };
+        let outcome = match outcome_result {
             Ok(outcome) => outcome,
             Err(error) => return Err(run.abort(error).await),
         };
@@ -471,6 +513,9 @@ impl SessionRun {
         if let Some(file) = &stdin_file {
             command.push_str(" < ");
             command.push_str(&shell_quote(&file.path));
+        }
+        if controls.stdin.is_some() {
+            command = input_relay::command(&command);
         }
         let cwd = transport.resolve_dir(spec.working_dir.as_deref());
 

@@ -67,6 +67,7 @@ mod exec;
 mod fake_daytona;
 mod fs;
 mod git;
+mod input_relay;
 mod labels;
 mod logs;
 mod nested;

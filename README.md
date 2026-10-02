@@ -43,6 +43,21 @@ process and served over the plugin wire; the Daytona suite runs live with
 See `docs/design.md` for the interface design
 and `docs/protocol.md` for the normative plugin wire protocol.
 
+## Streaming stdin on Daytona
+
+Native Daytona exec accepts `ExecControls::stdin` using a sandbox-side Python 3
+relay. The session input API carries bounded base64 frames and an explicit EOF;
+the child receives a real byte pipe while its output streams normally. This
+supports commands that read until EOF and interactive request/response input.
+Python 3 must be installed in the sandbox image. Nested container execution
+still reports streamed stdin unsupported. This does not change `spawn_stdio`'s
+separate UTF-8-only contract.
+
+Run the local relay contract tests with the Daytona crate's unit tests. The
+`stdin_stream` integration test is an opt-in live gate using `DAYTONA_API_KEY`;
+it creates and deletes one sandbox and checks binary input, interactive input,
+early exit, timeout, and cancellation.
+
 ## Nested Docker on Daytona
 
 Daytona can own a nested job container, sidecars, and one-shot action containers.
